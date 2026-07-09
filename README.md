@@ -35,6 +35,7 @@ O frontend roda no navegador e chama o backend **diretamente** (CORS liberado vi
 | `k8s/backend-*.yaml` | Deployment (2 réplicas) + Service `NodePort :30080` |
 | `k8s/frontend-*.yaml` | Deployment (2 réplicas) + Service `NodePort :30081` |
 | `kind-config.yaml` | Config de cluster [kind](https://kind.sigs.k8s.io/) para testar tudo localmente, mapeando as NodePorts para o host |
+| `k8s/gcp/*.yaml` | Overrides para deploy em produção no GKE (Artifact Registry, PD do GCP, `LoadBalancer`) — ver seção própria abaixo. **Não testado.** |
 
 ## O que foi corrigido (em relação ao repo original)
 
@@ -139,6 +140,108 @@ kubectl exec "$POD" -- mysql -h127.0.0.1 -uroot -pSenha123 meubanco -e "SELECT *
 kind delete cluster --name projeto1
 ```
 
+## Deploy em produção no GCP (GKE)
+
+> ⚠️ Diferente da seção anterior, este fluxo **não foi executado/testado** — são os arquivos e passos teoricamente necessários para rodar no GKE. Antes de usar em produção de verdade, valide num cluster GKE real.
+
+### Ideia geral
+
+Os manifests base (`k8s/mysql-*.yaml`, `k8s/backend-deployment.yaml` etc.) são agnósticos de nuvem. O que muda de local → GCP fica isolado em `k8s/gcp/`, que **sobrescreve** apenas o que precisa mudar:
+
+| Arquivo | Por que é diferente no GCP |
+|---|---|
+| `k8s/gcp/mysql-pvc.yaml` | Precisa de `storageClassName: standard-rwo` (disco persistente do GKE via CSI driver) — o `standard` do kind não existe fora do kind. Também sobe para `10Gi`, tamanho mínimo de um PD do Compute Engine. |
+| `k8s/gcp/backend-deployment.yaml` | `image` aponta para o Artifact Registry (`REGION-docker.pkg.dev/PROJECT_ID/...`) em vez do nome genérico local, e `imagePullPolicy: Always`. |
+| `k8s/gcp/frontend-deployment.yaml` | Mesma mudança de imagem/pull policy. |
+| `k8s/gcp/backend-service.yaml` / `frontend-service.yaml` | `type: LoadBalancer` em vez de `NodePort` (GKE provisiona um Network Load Balancer real com IP externo). |
+
+**Detalhe importante:** o `frontend/js.js` monta a URL do backend como `<mesmo host do navegador>:30080`. Em vez de reescrever esse código já testado, as duas Services do GCP usam o mesmo **IP externo estático compartilhado** (`loadBalancerIP`), cada uma numa porta diferente (frontend `:80`, backend `:30080`) — exatamente o mesmo padrão do NodePort local, só que via LoadBalancer. Isso é suportado nativamente pelo GCP reservando o IP com `--purpose=SHARED_LOADBALANCER_VIP`.
+
+### Pré-requisitos
+
+- Conta GCP com billing ativo e projeto criado
+- [`gcloud` CLI](https://cloud.google.com/sdk/docs/install) autenticado (`gcloud auth login`)
+- Um cluster GKE já criado, com `kubectl` configurado para apontar pra ele (`gcloud container clusters get-credentials`)
+- Um repositório no Artifact Registry para as imagens
+
+### 1. Criar cluster GKE (se ainda não existir)
+
+```bash
+gcloud container clusters create-auto projeto1 \
+  --project=PROJECT_ID \
+  --region=REGION
+
+gcloud container clusters get-credentials projeto1 --region=REGION
+```
+
+### 2. Criar repositório no Artifact Registry e enviar as imagens
+
+```bash
+gcloud artifacts repositories create k8s-projeto1 \
+  --repository-format=docker \
+  --location=REGION
+
+gcloud auth configure-docker REGION-docker.pkg.dev
+
+docker build -t REGION-docker.pkg.dev/PROJECT_ID/k8s-projeto1/backend:latest ./backend
+docker build -t REGION-docker.pkg.dev/PROJECT_ID/k8s-projeto1/frontend:latest ./frontend
+
+docker push REGION-docker.pkg.dev/PROJECT_ID/k8s-projeto1/backend:latest
+docker push REGION-docker.pkg.dev/PROJECT_ID/k8s-projeto1/frontend:latest
+```
+
+### 3. Reservar o IP externo compartilhado
+
+```bash
+gcloud compute addresses create projeto1-shared-ip \
+  --region=REGION \
+  --purpose=SHARED_LOADBALANCER_VIP
+
+gcloud compute addresses describe projeto1-shared-ip --region=REGION --format='value(address)'
+```
+
+### 4. Preencher os placeholders
+
+Substitua nos arquivos de `k8s/gcp/`:
+- `REGION-docker.pkg.dev/PROJECT_ID/...` → caminho real das imagens no Artifact Registry
+- `SHARED_STATIC_IP` (em `backend-service.yaml` e `frontend-service.yaml`) → IP obtido no passo 3
+
+```bash
+sed -i "s/REGION-docker.pkg.dev\/PROJECT_ID/<sua-regiao>-docker.pkg.dev\/<seu-project-id>/" k8s/gcp/backend-deployment.yaml k8s/gcp/frontend-deployment.yaml
+sed -i "s/SHARED_STATIC_IP/<ip-obtido-no-passo-3>/" k8s/gcp/backend-service.yaml k8s/gcp/frontend-service.yaml
+```
+
+### 5. Aplicar os manifests
+
+Os recursos cloud-agnósticos primeiro, depois as sobrescritas do GCP (a ordem do `kubectl apply` sobrescreve o que for aplicado por último):
+
+```bash
+kubectl apply -f k8s/mysql-secret.yaml
+kubectl apply -f k8s/mysql-init-configmap.yaml
+kubectl apply -f k8s/mysql-service.yaml
+kubectl apply -f k8s/gcp/mysql-pvc.yaml
+kubectl apply -f k8s/mysql-deployment.yaml
+kubectl apply -f k8s/gcp/backend-deployment.yaml
+kubectl apply -f k8s/gcp/backend-service.yaml
+kubectl apply -f k8s/gcp/frontend-deployment.yaml
+kubectl apply -f k8s/gcp/frontend-service.yaml
+```
+
+### 6. Acessar
+
+```bash
+kubectl get svc frontend backend
+```
+
+O `EXTERNAL-IP` de ambas deve ser o mesmo IP reservado no passo 3. Acesse `http://<IP>` no navegador.
+
+### Possíveis evoluções (não implementadas, fora do escopo pedido)
+
+- Trocar o MySQL em pod por **Cloud SQL** (gerenciado, com backups automáticos) usando o Cloud SQL Auth Proxy como sidecar.
+- Trocar as duas `LoadBalancer` por um único **Ingress** (GKE Ingress/GCE) com **Google-managed Certificate** para HTTPS num domínio próprio.
+- Mover as credenciais do `Secret` para o **Secret Manager** via CSI driver, em vez de ficarem no manifesto em texto plano.
+- `HorizontalPodAutoscaler` para escalar `backend`/`frontend` conforme carga.
+
 ## Comandos úteis de troubleshooting
 
 ```bash
@@ -176,7 +279,13 @@ kubectl rollout restart deployment/backend
 │   ├── backend-deployment.yaml
 │   ├── backend-service.yaml
 │   ├── frontend-deployment.yaml
-│   └── frontend-service.yaml
+│   ├── frontend-service.yaml
+│   └── gcp/                          # overrides para deploy no GKE (não testado)
+│       ├── mysql-pvc.yaml            # storageClassName: standard-rwo
+│       ├── backend-deployment.yaml   # imagem via Artifact Registry
+│       ├── backend-service.yaml      # LoadBalancer, IP compartilhado :30080
+│       ├── frontend-deployment.yaml  # imagem via Artifact Registry
+│       └── frontend-service.yaml     # LoadBalancer, IP compartilhado :80
 └── kind-config.yaml       # cluster local para testes
 ```
 
